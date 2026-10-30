@@ -640,18 +640,18 @@ function populateVoices() {
     (v.lang.toLowerCase().startsWith(lang) ? 100 : 0) +
     (v.lang.toLowerCase().replace('_', '-') === locale ? 50 : 0) +
     // Built-in voices read long stretches without restarting, so they beat online ones.
-    (/^daniel/i.test(v.name) ? 80 : /^samantha/i.test(v.name) ? 40 : 0) +
+    (/^reed/i.test(v.name) ? 80 : 0) +
     (v.localService ? 20 : 0) +
     (/natural|neural|premium|enhanced|siri/i.test(v.name) ? 10 : 0) +
     (v.default ? 1 : 0);
-  const sorted = [...voices].sort((a, b) => score(b) - score(a) || a.name.localeCompare(b.name));
+  // Only offer a short list of English voices; fall back to everything on devices that have none of them.
+  const KEEP = /^(?:reed|grandpa|eddy|rocko)\b/i;
+  const keep = v => KEEP.test(v.name) && /^en/i.test(v.lang);
+  const shown = voices.some(keep) ? voices.filter(keep) : voices;
+  const sorted = [...shown].sort((a, b) => score(b) - score(a) || a.name.localeCompare(b.name));
   const sel = $('#voice');
-  let saved = store.get('reader.voice') || sel.value;
-  // One time only: switch to the new default voice (Daniel); later picks are remembered.
-  if (!store.get('reader.defaultDaniel')) {
-    saved = null;
-    store.set('reader.defaultDaniel', true);
-  }
+  // Only a voice the person picked from the menu overrides the default (Reed).
+  const saved = store.get('reader.voicePick');
   sel.innerHTML = '';
   for (const v of sorted) {
     const o = document.createElement('option');
@@ -907,7 +907,7 @@ $('#skipCites').onchange = e => {
 };
 
 $('#voice').onchange = () => {
-  store.set('reader.voice', $('#voice').value);
+  store.set('reader.voicePick', $('#voice').value);
   if (state.playing) speak(state.idx);
 };
 
