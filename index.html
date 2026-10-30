@@ -153,7 +153,9 @@
   .field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   .field select { height: 36px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 0 8px; max-width: 240px; }
   .rate-val { min-width: 38px; text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
-  input[type=range] { accent-color: var(--accent); }
+  input[type=range], input[type=checkbox] { accent-color: var(--accent); }
+  .field.check { gap: 6px; cursor: pointer; white-space: nowrap; }
+  .field.check input { width: 16px; height: 16px; margin: 0; }
 
   @media (max-width: 640px) {
     .settings { margin-left: 0; width: 100%; }
@@ -251,6 +253,9 @@
         <label class="field voice">Voice
           <select id="voice"></select>
         </label>
+        <label class="field check" title="Don't read citations like (Smith, 2020) or [12], or the reference list">
+          <input type="checkbox" id="skipCites"> Skip citations
+        </label>
       </div>
     </div>
   </div>
@@ -283,9 +288,10 @@ const store = {
   },
 };
 
-const state = { title: '', blocks: [], units: [], idx: 0, playing: false, rate: 1 };
+const state = { title: '', blocks: [], units: [], idx: 0, playing: false, rate: 1, skipCites: true };
 let token = 0;            // bumps whenever speech is restarted, so stale callbacks are ignored
-let currentUtterance = null; // kept referenced so Chrome doesn't garbage-collect it mid-speech
+let currentUtterances = []; // kept referenced so Chrome doesn't garbage-collect them mid-speech
+let queuedUpTo = -1; // highest sentence index handed to the speech engine
 let errorStreak = 0;
 let wordTimer = null;
 let activeEl = null, activeWord = null;
@@ -331,6 +337,31 @@ function splitSentences(text) {
   return merged.flatMap(s => chunk(s));
 }
 const ABBREV = /(?:^|\s)(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|e\.g|i\.e|cf|al|Fig|No|Vol|pp|Inc|Ltd|Co|[A-Z])\.$/;
+
+// Citations like (Smith et al., 2019; Jones 2020), Smith (2020), [3, 5–7] and superscript numbers.
+const CITE_NAME = String.raw`[A-Z][\p{L}'’\-]+`;
+const CITE_YEAR = String.raw`(?:1[6-9]\d\d|20\d\d)[a-z]?|n\.d\.`;
+const CITE_PAGE = String.raw`(?:,\s*(?:pp?\.|p)\s*[\d–\-]+)?`;
+const CITE_ITEM = String.raw`${CITE_NAME}(?:,?\s+(?:et al\.|and|&)|,?\s+${CITE_NAME})*,?\s+(?:${CITE_YEAR})(?:,\s*(?:${CITE_YEAR}))*${CITE_PAGE}`;
+const CITE = new RegExp([
+  String.raw`\s*\((?:(?:see(?: also)?|e\.g\.|cf\.)[,\s]+)?${CITE_ITEM}(?:;\s*${CITE_ITEM})*\)`,
+  String.raw`\s*\((?:${CITE_YEAR})${CITE_PAGE}\)`,
+  String.raw`\s*\[\d+(?:\s*[-–,]\s*\d+)*\]`,
+  String.raw`[⁰¹²³⁴-⁹]+`,
+].join('|'), 'gu');
+const REF_HEADING = /^(?:references|bibliography|works cited|literature cited|reference list|sources)$/i;
+
+// What actually gets spoken for a sentence, plus a map from each spoken character back to the original.
+function spokenText(unit) {
+  if (!state.skipCites) return { text: unit.text, map: null };
+  if (unit.ref) return { text: '', map: [] };
+  let text = '', last = 0;
+  const map = [];
+  const keep = (from, to) => { for (let c = from; c < to; c++) { text += unit.text[c]; map.push(c); } };
+  for (const m of unit.text.matchAll(CITE)) { keep(last, m.index); last = m.index + m[0].length; }
+  keep(last, unit.text.length);
+  return /\p{L}|\d/u.test(text) ? { text, map } : { text: '', map: [] };
+}
 
 function textToBlocks(t) {
   t = t.replace(/\r\n?/g, '\n');
@@ -488,6 +519,7 @@ function loadDocument(title, blocks, startIdx = 0, save = true) {
   h.textContent = title;
   frag.append(h);
 
+  let inRefs = false; // inside a References / Bibliography section
   for (const b of blocks) {
     if (b.kind === 'page') {
       const d = document.createElement('div');
@@ -496,13 +528,15 @@ function loadDocument(title, blocks, startIdx = 0, save = true) {
       frag.append(d);
       continue;
     }
+    if (REF_HEADING.test(b.text.trim().replace(/[:.]$/, ''))) inRefs = true;
+    else if (b.kind === 'h') inRefs = false;
     const el = document.createElement(b.kind === 'h' ? 'h2' : 'p');
     for (const sent of splitSentences(b.text)) {
       const span = document.createElement('span');
       span.className = 's';
       span.textContent = sent;
       span.dataset.i = state.units.length;
-      state.units.push({ text: sent, el: span, words: sent.split(/\s+/).length });
+      state.units.push({ text: sent, el: span, words: sent.split(/\s+/).length, ref: inRefs });
       el.append(span, ' ');
     }
     if (el.childNodes.length) frag.append(el);
@@ -605,11 +639,19 @@ function populateVoices() {
   const score = v =>
     (v.lang.toLowerCase().startsWith(lang) ? 100 : 0) +
     (v.lang.toLowerCase().replace('_', '-') === locale ? 50 : 0) +
-    (/natural|neural|premium|enhanced|google|siri/i.test(v.name) ? 10 : 0) +
+    // Built-in voices read long stretches without restarting, so they beat online ones.
+    (/^daniel/i.test(v.name) ? 80 : /^samantha/i.test(v.name) ? 40 : 0) +
+    (v.localService ? 20 : 0) +
+    (/natural|neural|premium|enhanced|siri/i.test(v.name) ? 10 : 0) +
     (v.default ? 1 : 0);
   const sorted = [...voices].sort((a, b) => score(b) - score(a) || a.name.localeCompare(b.name));
   const sel = $('#voice');
-  const saved = store.get('reader.voice') || sel.value;
+  let saved = store.get('reader.voice') || sel.value;
+  // One time only: switch to the new default voice (Daniel); later picks are remembered.
+  if (!store.get('reader.defaultDaniel')) {
+    saved = null;
+    store.set('reader.defaultDaniel', true);
+  }
   sel.innerHTML = '';
   for (const v of sorted) {
     const o = document.createElement('option');
@@ -631,31 +673,99 @@ function speak(i) {
   setActive(i);
   savePos();
   synth.cancel();
+  queuedUpTo = i - 1;
+  currentUtterances = [];
+  // A tiny delay after cancel() avoids Chrome occasionally dropping the next utterance.
+  setTimeout(() => {
+    if (my !== token) return;
+    if (hasMore(i)) enqueue(i, my);
+    else speak(state.units.length); // only skipped sentences left
+  }, 30);
+}
 
-  const u = new SpeechSynthesisUtterance(state.units[i].text);
+const hasMore = k => state.units.slice(k).some(u => spokenText(u).text);
+
+// Several sentences are spoken as one utterance so the voice doesn't restart (and pause)
+// between them. Online voices cut off long utterances, so they get smaller groups.
+function enqueue(i, my) {
+  if (i >= state.units.length || i <= queuedUpTo) return;
   const v = currentVoice();
+  const maxLen = v && !v.localService ? 220 : 1500;
+  // pieces: the sentences in this utterance, with where each starts in the spoken text.
+  // Sentences with nothing left to say (e.g. reference list entries when skipping citations) are passed over.
+  const pieces = [];
+  let text = '', j = i;
+  for (; j < state.units.length; j++) {
+    const s = spokenText(state.units[j]);
+    if (!s.text) continue;
+    if (pieces.length && text.length + 1 + s.text.length > maxLen) break;
+    if (pieces.length) text += ' ';
+    pieces.push({ idx: j, offset: text.length, map: s.map });
+    text += s.text;
+  }
+  j--;
+  queuedUpTo = j;
+  if (!pieces.length) return;
+
+  // Map a character position in the utterance to its sentence and highlight the word.
+  const follow = charIndex => {
+    let k = 0;
+    while (k + 1 < pieces.length && pieces[k + 1].offset <= charIndex) k++;
+    const p = pieces[k];
+    if (state.idx !== p.idx) { state.idx = p.idx; setActive(p.idx); savePos(); }
+    const c = Math.max(0, charIndex - p.offset);
+    highlightWord(p.map ? (p.map[Math.min(c, p.map.length - 1)] ?? 0) : c);
+  };
+
+  // Some voices (e.g. Google's online ones) never report word positions, so estimate them.
+  // Punctuation counts extra because voices pause there; pace is learned per voice as it reads.
+  const cost = [0];
+  for (let c = 0; c < text.length; c++) {
+    const pause = /[.!?…]/.test(text[c]) ? 10 : /[,;:—–]/.test(text[c]) ? 4 : 0;
+    cost.push(cost[c] + 1 + pause);
+  }
+  const charAt = spent => {
+    let c = 0;
+    while (c < text.length && cost[c + 1] <= spent) c++;
+    return c;
+  };
+  const voiceKey = v ? v.voiceURI : 'default';
+
+  const u = new SpeechSynthesisUtterance(text);
   if (v) { u.voice = v; u.lang = v.lang; }
   u.rate = state.rate;
-  let gotBoundary = false;
+  let gotBoundary = false, t0 = 0;
   u.onstart = () => {
     if (my !== token) return;
     errorStreak = 0;
-    // Some voices (e.g. Google's online ones) never report word positions, so estimate them instead.
-    const t0 = performance.now();
+    follow(0);
+    enqueue(j + 1, my);
+    t0 = performance.now();
+    const pace = (store.get('reader.pace') || {})[voiceKey] || 17;
     clearInterval(wordTimer);
     wordTimer = setInterval(() => {
       if (my !== token || gotBoundary) { clearInterval(wordTimer); return; }
-      highlightWord((performance.now() - t0) / 1000 * 14.5 * state.rate);
+      follow(charAt((performance.now() - t0) / 1000 * pace * state.rate));
     }, 90);
   };
   u.onboundary = e => {
     if (my !== token || (e.name && e.name !== 'word')) return;
     gotBoundary = true;
-    highlightWord(e.charIndex);
+    follow(e.charIndex);
   };
   u.onend = () => {
-    clearInterval(wordTimer);
-    if (my === token && state.playing) speak(i + 1);
+    if (state.idx >= i && state.idx <= j) clearInterval(wordTimer);
+    if (my !== token || !state.playing) return;
+    const secs = (performance.now() - t0) / 1000;
+    if (!gotBoundary && t0 && secs > 2) {
+      const paces = store.get('reader.pace') || {};
+      const measured = cost[text.length] / secs / state.rate;
+      paces[voiceKey] = paces[voiceKey] ? paces[voiceKey] * 0.4 + measured * 0.6 : measured;
+      store.set('reader.pace', paces);
+    }
+    currentUtterances = currentUtterances.filter(x => x !== u);
+    if (!hasMore(j + 1)) speak(state.units.length); // finished the document
+    else enqueue(j + 1, my);
   };
   u.onerror = e => {
     if (my !== token || e.error === 'interrupted' || e.error === 'canceled') return;
@@ -665,11 +775,10 @@ function speak(i) {
       showMsg(`Speech stopped working (${e.error}). Try picking a different voice.`, true);
       return;
     }
-    if (state.playing) speak(i + 1);
+    if (state.playing) speak(j + 1);
   };
-  currentUtterance = u;
-  // A tiny delay after cancel() avoids Chrome occasionally dropping the next utterance.
-  setTimeout(() => { if (my === token) synth.speak(u); }, 30);
+  currentUtterances.push(u);
+  synth.speak(u);
 }
 
 function play() {
@@ -791,6 +900,12 @@ $('#presets').onclick = e => {
   if (state.playing) speak(state.idx);
 };
 
+$('#skipCites').onchange = e => {
+  state.skipCites = e.target.checked;
+  store.set('reader.skipCites', state.skipCites);
+  if (state.playing) speak(state.idx);
+};
+
 $('#voice').onchange = () => {
   store.set('reader.voice', $('#voice').value);
   if (state.playing) speak(state.idx);
@@ -824,6 +939,8 @@ if (!synth) {
   synth.onvoiceschanged = populateVoices;
 
   setRate(store.get('reader.rate') || 1);
+  state.skipCites = store.get('reader.skipCites') ?? true;
+  $('#skipCites').checked = state.skipCites;
   const fs = store.get('reader.fontSize');
   if (fs) setFontSize(fs);
 
